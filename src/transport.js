@@ -16,7 +16,7 @@ function byteLen(s){
  * @param {Object|Array} data  上报数据
  * @returns {Promise<void>} --成功 resolve 失败reject
  */
-function transports(data){
+export function transport(data){
   const isArray = Array.isArray(data)
   const json = JSON.stringify(data)
 
