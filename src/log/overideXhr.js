@@ -327,8 +327,10 @@ var overrideJsonp = function(onRequestSend,afterRequestReturn){
   }
 }
 
-// 定义方法queryAllNode，参数ignoreTag：需要忽略的标签（如['script','style']，格式由_shouldIgnoreNode决定）
-var queryAllNode = function (ignoreTag){
+//工具类
+const util = {
+  // 定义方法queryAllNode，参数ignoreTag：需要忽略的标签（如['script','style']，格式由_shouldIgnoreNode决定）
+  queryAllNode:function (ignoreTag){
   var that = this
   //创建DOM节点迭代器，赋值给result，这是浏览器原生API，用于高效遍历/过滤DOM节点
   var result = document.createNodeIterator(
@@ -344,4 +346,232 @@ var queryAllNode = function (ignoreTag){
   )
   // 返回创建好的节点迭代器：外部代码拿到后，可通过result.nextNode()逐个获取过滤后的有效元素节点
   return result
+  },
+
+  // 定义方法：从DOM节点提取图片地址，入参dom=目标节点，imgFilter=图片过滤规则
+  getImgSrcFromDom:function (dom,imgFilter){
+  var src 
+  // 第一类：显性图片——判断当前节点是否是IMG标签（nodeName转大写避免大小写问题，如<img>/<Img>）
+  if(dom.nodeName.toUpperCase()=='IMG'){
+    src = dom.getAttribute("src")
+  }else{
+    // 第二类：隐性图片——非IMG节点，提取背景图地址
+    // 获取节点的**计算后样式**（包含行内/外链/默认样式，比dom.style更全面，能拿到真实生效的样式）
+    var computedStyle = window.getComputedStyle(dom)
+     // 提取背景图样式：优先取background-image，无则取background（background是复合样式，可能包含图片）
+    var bgImg = computedStyle.getPropertyValue("background-image")||computedStyle.getPropertyValue('background')
+     // 调用内部方法：从背景图样式字符串中解析出真实图片地址（如从url("xxx.jpg")中提取xxx.jpg）
+    var tempSrc = this._getImgSrcFromBgImg(bgImg,imgFilter)
+    // 双重校验：解析出了临时地址 + 该地址符合图片过滤规则（是有效图片）
+    if(tempSrc&&this._isImg(tempSrc,imgFilter)){
+      src = tempSrc
+    }
+  }
+  return src
+  },
+
+  // 定义方法：判断节点是否在首屏范围内，注释的currentNode是预留入参（实际未使用，用this.currentPos取位置）
+  isInFirstScreen:function(){
+    // 核心判断1：节点隐藏（display:none/visibility:hidden等）→ top和bottom均为0，直接返回false（隐藏节点无需统计）
+    if(!this.currentPos.top&&!this.currentPos.bottom){
+      return false
+    }
+
+    // 获取浏览器**可视区域高度**、可视区域宽度
+    var screenHeight = window.innerHeight
+    var scrrenWidth = window.innerWidth
+
+    //页面垂直滚动距离、节点自身的顶部偏移、节点自身的左侧偏移、节点自身的右侧偏移
+    var scrollTop = this.currentPos.scrollTop
+    var top = this.currentPos.top
+    var left  = this.currentPos.left
+    var right = this.currentPos.right
+
+    // 核心判断2：结构上是否在首屏内（同时满足垂直+水平条件，缺一不可）
+    // 垂直：滚动距离+节点顶部 < 可视区域高度 → 节点顶部在首屏内
+    // 水平：节点右侧>0 且 节点左侧<可视宽度 → 节点水平方向和首屏有重叠
+    if((scrollTop+top<screenHeight&&right>0&&left<scrrenWidth)){
+      return true
+    }
+
+    // 不满足，返回false（非首屏）
+    return false
+  },
+
+  //轮询获取首屏图片的性能时间，入参包含全局对象、图片列表、成功/失败回调
+  cycleGettingPerformaceTime:function(_global,firstScreenImages,callbackWithImages,callbackWithoutImages){
+    // 轮询次数限制：最多轮询5次（每次1秒，总计5秒超时），避免无限轮询
+    var fetchCount = 5
+
+     // 保存当前对象的this → 内部闭包函数中访问当前对象的方法（解决this丢失）
+    var that = this
+    // 格式化图片地址：去掉协议/前缀（如http/https）→ 便于和performance.getEntries()返回的地址匹配（部分浏览器返回的地址无协议）
+    var protocalRemovedFirstScreenImages = that.formateUrlList(firstScreenImages,'remove')
+
+    //有效性能数据时，执行成功回调（封装回调逻辑，避免重复代码）
+    var runCallbackWithImages = function(firstScreenImagesDetail){
+      // 取最晚完成的图片时间 → 数组已倒序，第一个元素的responseEnd是最大值（首屏图片时间）
+      var resultResponseEnd = firstScreenImagesDetail[0].responseEnd
+
+      // 异常数据过滤：过滤无效的responseEnd（避免浏览器兼容问题导致的错误数据）
+      // 有效条件：>0（已加载） && <1000*1000（不是时间戳，是相对时长，单位ms）
+      if(resultResponseEnd>0&&resultResponseEnd<1000*1000){
+        callbackWithImages({
+          firstScreenTime:parseInt(resultResponseEnd),// 首屏图片时间（取整，ms）
+          firstScreenTimeStamp:parseInt(resultResponseEnd)+_global._originalNavStart,// 绝对时间戳（相对时间+页面导航开始时间）
+          firstScreenImagesDetail:firstScreenImagesDetail // 所有首屏图片的性能详情
+        })
+      }
+    }
+
+    //单次获取性能数据的逻辑（轮询时重复执行）
+    var getPerformanceTime = function(){
+      // 步骤1：获取浏览器所有已加载资源的性能条目 → 包含图片/JS/CSS/接口的加载时间（responseEnd/startTime等）
+      var source = performance.getEntries()
+
+      // 步骤2：匹配首屏图片 → 从性能条目中筛选出首屏图片的性能数据（未去重）
+      var ununiqueDetail = that._getUnuniqueDetailFromSource(source,protocalRemovedFirstScreenImages,_global.img)
+      var firstScreenImagesDetail = []
+
+      // 步骤3：图片去重 → 遍历未去重数据，生成src映射表（key=图片地址，value=性能条目索引）
+      var scrMap = that._getSrcMapFromUnuniqueDetail(ununiqueDetail)
+
+      // 步骤4：生成去重后的首屏图片性能详情数组
+      var firstScreenImagesDetail = that._getUniquedFirstScreenDetail(ununiqueDetail,srcMap)
+
+      // 步骤5：倒序排序 → 按responseEnd（加载完成时间）从大到小，最晚完成的在第一个
+      firstScreenImagesDetail.sort(function(a,b){
+        return b.responseEnd - a.responseEnd
+      })
+
+      // 步骤6：轮询次数减1
+      fetchCount--
+
+      // 分支1：未超时（还有轮询次数）
+      if(fetchCount>=0){
+        // 所有首屏图片都匹配到性能数据 → 无需继续轮询，清空定时器并执行成功回调
+        if(firstScreenImagesDetail.length===protocalRemovedFirstScreenImages.length){
+          clearInterval(timer);
+          runCallbackWithImages(firstScreenImagesDetail)
+        }
+      }else{
+        // 分支2：已超时（5次轮询结束）
+        if(firstScreenImagesDetail.length>0){
+          // 虽超时，但匹配到部分图片数据 → 执行成功回调（用已有数据）
+          runCallbackWithImages(firstScreenImagesDetail)
+        }else{
+           // 超时且无任何有效数据 → 执行失败回调
+          callbackWithoutImages()
+        }
+        // 清空定时器，结束轮询
+        clearInterval(timer)
+      }
+    }
+
+     // 步骤7：开启轮询定时器 → 每1000ms执行一次getPerformanceTime，采集性能数据
+    var timer = setInterval(getPerformanceTime,1000)
+
+    // 步骤8：立即执行一次 → 无需等待1秒，减少统计延迟
+    getPerformanceTime();
+  },
+
+  //无图首屏时，获取DOM就绪时间（DOMContentLoaded），入参=全局对象+结果回调
+  getDomReadyTime:function(_global,callback){
+    //轮询计数器:记录已轮询次数，用于兜底终止
+    var count = 0;
+
+    // 定义轮询核心处理函数：判断数据有效性并执行回调
+    var handler = function(){
+      // 核心判断：DOMContentLoaded事件开始时间是否有效（非0=事件已触发）
+      // performance.timing.domContentLoadedEventStart：DOM结构加载完成的时间戳（相对于页面导航开始）
+      if(performance.timing.domContentLoadedEventStart!=0){
+        callback(performance.timing.domContentLoadedEventStart,'domContentLoadedEventStart')
+      }
+
+      // 轮询终止条件：计数器≥50次（总计25秒） OR 数据已有效 → 清空定时器，结束轮询
+      if(++count>=50||performance.timing.domContentLoadedEventStart!=0){
+        clearInterval(timer)
+      }
+    }
+
+    // 开启轮询定时器 → 每500ms执行一次handler，采集数据（兼顾实时性和性能）
+    var timer = setInterval(handler,500)
+    // 立即执行一次handler → 无需等待500ms，减少统计延迟
+    handler()
+  }
+
+}
+
+
+// 定义主函数：筛选首屏内的所有有效图片（下划线表示内部私有方法，外部不直接调用）
+function _getImgInFirstScreen(){
+  // 获取浏览器可视区域高/宽
+  var screenHeight = window.innerHeight
+  var screenWidth = window.innerWidth
+
+  // 设备信息上报：将屏幕宽高写入全局对象_global，仅执行一次（首屏统计的基础数据）
+  _global.device.screenHeight = screenHeight
+  _global.device.screenWidth = screenWidth
+
+  // 步骤1：获取DOM节点迭代器 → 调用之前的queryAllNode，过滤掉_global.ignoreTag指定的标签（如script/style）
+  var nodeIterator = util.queryAllNode(_global.ignoreTag);
+  // 步骤2：初始化迭代器，获取第一个过滤后的有效DOM节点
+  var currentNode = nodeIterator.nextNode()
+  // 步骤3：声明数组imgList → 存储首屏内的有效图片地址（用于去重和最终返回）
+  var imgList = []
+
+  // 定义内部回调：处理找到的图片地址（去重+过滤网络图片
+  var onImgSrcFound = function(imgSrc){
+    // 解析图片地址的协议（如http/https/ftp/base64）→ 调用util的URL解析方法
+    var protocol = util.parseUrl(imgSrc).protocol;
+    // 过滤：仅保留http/https开头的**网络图片**（排除base64/dataURL/本地图片，这类无需网络请求）
+    if(protocol&&protocol.indexOf('http')===0){
+      // 去重：图片地址未在imgList中，才加入（避免同一图片多次统计）
+      if(imgList.indexOf(imgSrc)===-1){
+        imgList.push(imgSrc)
+      }
+    }
+  }
+
+  // 步骤4：循环遍历所有DOM节点 → nextNode()返回null表示遍历结束
+  while(currentNode){
+    // 4.1 提取当前节点的图片地址 → 调用getImgSrcFromDom，传入全局图片过滤规则
+    var imgSrc = util.getImgSrcFromDom(currentNode,_global.img)
+
+     // 4.2 无有效图片地址 → 跳过当前节点，继续遍历下一个
+    if(!imgSrc){
+      currentNode = nodeIterator.nextNode();
+      continue;
+    }
+
+    // 4.3 记录当前节点的位置信息 → 调用util.recordCurrentPos，将位置存入this.currentPos（为isInFirstScreen准备）
+    util.recordCurrentPos(currentNode,_global);
+
+    // 4.4 判断节点是否在首屏内 → 调用isInFirstScreen
+    if(util.isInFirstScreen(currentNode)){
+       // 在首屏内 → 处理图片地址（去重+过滤网络图片）
+      onImgSrcFound(imgSrc)
+    }else{
+      // 非首屏 → 统计非首屏图片信息（存入_global.ignoredImages，用于后续性能分析/上报）
+      var currentPos = util.currentPos
+      _global.ignoredImages.push({
+        src:imgSrc, // 非首屏图片地址      
+        screenHeight:screenHeight,  // 设备屏幕高度      
+        screenWidth:screenWidth, // 设备屏幕宽度
+        scrollTop:currentPos.scrollTop, // 滚动距离   
+        top:currentPos.top, // 节点顶部偏移     
+        bottom:currentPos.bottom, // 节点底部偏移          
+        vertical:(currentPos.scrollTop+currentPos.top)<=screenHeight,//垂直方向是否接近首屏 
+        left:currentPos.left, // 节点左侧偏移    
+        right:currentPos.right, // 节点右侧偏移  
+        horizontal:currentPos.right>=0&&currentPos.left<=screenWidth // 水平方向是否接近首屏
+      })
+    }
+
+    // 4.5 遍历下一个节点，进入下一次循环
+    currentNode = nodeIterator.nextNode()
+  }
+
+  // 步骤5：格式化图片列表 → 调用util.formateUrlList，补全协议/去掉多余前缀（为后续匹配performance数据准备）
+  return util.formateUrlList(img,'add')
 }
